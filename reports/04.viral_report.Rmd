@@ -1,0 +1,410 @@
+---
+title: "VERVE module 04: RNA viral detection"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    dev: svg
+params:
+  out_dir: "."
+  sample_sheet: "../samples.tsv"
+  write_calls_tsv: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      dev = "svg")
+library(tidyverse)
+library(knitr)
+```
+
+# Settings
+
+Edit this chunk to change the positivity rule. Nothing is excluded from the
+pipeline outputs: this report labels, it does not filter.
+
+Detection is reported in two tiers, because a single threshold cannot handle
+both arms of this reference. An RNA virus present as an infection covers much
+of its genome. A DNA virus such as a herpesvirus is detected here through
+transcription, so coverage concentrates on a few transcribed genes and breadth
+stays low however real the signal. The confident tier is what the data can
+support on its own; the suggestive tier is what needs a coverage profile
+before it can be called either way.
+
+```{r thresholds}
+# Confident tier: all three must hold
+tier1_min_reads <- 10
+tier1_min_breadth <- 0.10        # covered bases over reference length
+tier1_min_windows_fraction <- 0.30
+
+# Suggestive tier: enough reads to be worth inspecting, but failing the above
+tier2_min_reads <- 100
+
+# Blank comparison. A taxon must exceed this multiple of its RPM in the blank.
+# Taxa absent from the blank pass automatically.
+blank_ratio_min <- 10
+
+# Which RPM is used for the blank comparison and the headline figures.
+# "rpm_total"   per million reads surviving trimming
+# "rpm_nonhost" per million reads STAR could not place
+# The two differ by an order of magnitude here, because the non-host fraction
+# ranges from 2.5% to 97%. Whichever is chosen must be named in the methods.
+rpm_metric <- "rpm_total"
+
+# Group label marking the negative controls in the sample sheet
+blank_prefix <- "blank"
+```
+
+```{r read_inputs}
+out_step <- file.path(params$out_dir, "04_viral")
+counts_dir <- file.path(out_step, "counts")
+
+samples_meta <- read_tsv(params$sample_sheet, show_col_types = FALSE) |>
+  select(any_of(c("sample_id", "body_site", "group", "batch")))
+
+if ("body_site" %in% names(samples_meta)) {
+  samples_meta <- samples_meta |>
+    mutate(body_site = str_to_lower(str_trim(body_site)))
+}
+
+per_taxid <- read_tsv(file.path(counts_dir, "viral_per_taxid.tsv"),
+                      show_col_types = FALSE)
+denominators <- read_tsv(file.path(counts_dir, "viral_denominators.tsv"),
+                         show_col_types = FALSE)
+
+is_blank <- function(x) !is.na(x) & str_starts(x, blank_prefix)
+
+# windows_fraction is written by merge_viral.py; recomputed here if an older
+# output is being read
+if (!"windows_fraction" %in% names(per_taxid)) {
+  per_taxid <- per_taxid |>
+    mutate(windows_total = pmax(1, ceiling(total_ref_length / 1000)),
+           windows_fraction = windows_covered / windows_total)
+}
+
+detections <- per_taxid |>
+  mutate(rpm_used = .data[[rpm_metric]]) |>
+  left_join(samples_meta, by = "sample_id")
+
+blank_samples <- detections |>
+  filter(is_blank(group)) |>
+  pull(sample_id) |>
+  unique()
+```
+
+# Denominators
+
+The two RPM denominators disagree sharply here, so any abundance figure has to
+say which it uses. The non-host fraction is what module 01 could not place on
+the human genome, and it ranges widely across these samples.
+
+```{r denominators_table}
+denominators |>
+  left_join(samples_meta, by = "sample_id") |>
+  transmute(
+    sample = sample_id,
+    site = if ("body_site" %in% names(samples_meta)) body_site else NA,
+    group = if ("group" %in% names(samples_meta)) group else NA,
+    `trimmed pairs (M)` = round(trimmed_pairs / 1e6, 1),
+    `non-host pairs (M)` = round(nonhost_pairs / 1e6, 1),
+    `non-host %` = round(100 * nonhost_fraction, 1)
+  ) |>
+  kable()
+```
+
+# The noise floor, measured on the blank
+
+Every taxon the negative control picks up is noise by construction, so the
+blank tells us what spurious assignment looks like in these libraries rather
+than our having to guess.
+
+```{r blank_profile}
+if (length(blank_samples) == 0) {
+  cat("No blank controls in the sample sheet; the blank comparison below is skipped.\n")
+} else {
+  detections |>
+    filter(sample_id %in% blank_samples) |>
+    arrange(desc(reads)) |>
+    transmute(
+      sample = sample_id,
+      taxon = virus_name,
+      family,
+      `ref length (kb)` = round(total_ref_length / 1000, 1),
+      reads,
+      `breadth %` = round(100 * breadth, 2),
+      windows = str_c(windows_covered, " / ", windows_total),
+      `windows frac` = round(windows_fraction, 3),
+      rpm = round(rpm_used, 2)
+    ) |>
+    head(20) |>
+    kable(caption = "Highest-count taxa in the negative control")
+}
+```
+
+```{r blank_ceiling}
+if (length(blank_samples) > 0) {
+  blank_rows <- filter(detections, sample_id %in% blank_samples)
+  tibble(
+    metric = c("taxa detected", "max reads", "max breadth %",
+               "max windows fraction"),
+    value = c(
+      as.character(nrow(blank_rows)),
+      format(max(blank_rows$reads), big.mark = ","),
+      sprintf("%.2f", 100 * max(blank_rows$breadth)),
+      sprintf("%.3f", max(blank_rows$windows_fraction))
+    )
+  ) |>
+    kable(caption = "Ceiling observed in the blank")
+}
+```
+
+# Where the thresholds fall
+
+Each point is one taxon in one sample. The blank's taxa are drawn separately,
+so the thresholds can be read against the measured noise rather than against
+an assumption.
+
+```{r threshold_plot, fig.width = 7.5, fig.height = 5}
+plot_data <- detections |>
+  mutate(source = if_else(sample_id %in% blank_samples,
+                          "negative control", "sample"))
+
+ggplot(plot_data, aes(x = windows_fraction, y = breadth, size = reads,
+                      colour = source)) +
+  geom_hline(yintercept = tier1_min_breadth, linetype = "dashed") +
+  geom_vline(xintercept = tier1_min_windows_fraction, linetype = "dashed") +
+  geom_point(alpha = 0.55) +
+  scale_size_continuous(trans = "log10", labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_colour_manual(values = c("sample" = "#2b6cb0",
+                                 "negative control" = "#c53030")) +
+  labs(x = "Fraction of reference windows covered",
+       y = "Breadth (covered bases over reference length)",
+       size = "Reads", colour = NULL) +
+  theme_minimal()
+```
+
+The top right quadrant is the confident tier. Points far left with high read
+counts are the pattern to be wary of: many reads stacked on one short stretch
+of the reference.
+
+```{r distributions}
+detections |>
+  summarise(
+    `taxon-sample rows` = n(),
+    `median reads` = median(reads),
+    `p90 reads` = quantile(reads, 0.90),
+    `median breadth %` = round(100 * median(breadth), 2),
+    `p99 breadth %` = round(100 * quantile(breadth, 0.99), 2),
+    `rows breadth >= 10%` = sum(breadth >= tier1_min_breadth),
+    `rows windows frac >= 0.3` = sum(windows_fraction >= tier1_min_windows_fraction)
+  ) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  kable(caption = "Distribution across all taxon-sample rows")
+```
+
+# Detections
+
+```{r calls}
+blank_rpm <- detections |>
+  filter(sample_id %in% blank_samples) |>
+  group_by(virus_taxid) |>
+  summarise(blank_rpm = max(rpm_used), .groups = "drop")
+
+calls <- detections |>
+  filter(!sample_id %in% blank_samples) |>
+  left_join(blank_rpm, by = "virus_taxid") |>
+  mutate(
+    blank_rpm = replace_na(blank_rpm, 0),
+    blank_ratio = if_else(blank_rpm > 0, rpm_used / blank_rpm, NA_real_),
+    passes_blank = is.na(blank_ratio) | blank_ratio >= blank_ratio_min,
+    meets_tier1 = reads >= tier1_min_reads &
+      breadth >= tier1_min_breadth &
+      windows_fraction >= tier1_min_windows_fraction,
+    tier = case_when(
+      meets_tier1 & passes_blank  ~ "confident",
+      meets_tier1 & !passes_blank ~ "confident but blank-matched",
+      reads >= tier2_min_reads    ~ "suggestive, needs coverage check",
+      TRUE                        ~ "below thresholds"
+    )
+  )
+```
+
+## Confident tier
+
+```{r tier1_table}
+tier1 <- calls |> filter(str_starts(tier, "confident"))
+
+if (nrow(tier1) == 0) {
+  cat("No taxon met the confident tier.\n")
+} else {
+  tier1 |>
+    arrange(sample_id, desc(reads)) |>
+    transmute(
+      sample = sample_id,
+      site = if ("body_site" %in% names(calls)) body_site else NA,
+      taxon = virus_name,
+      genus,
+      family,
+      reads,
+      `breadth %` = round(100 * breadth, 1),
+      `windows frac` = round(windows_fraction, 2),
+      rpm = round(rpm_used, 1),
+      `blank ratio` = if_else(is.na(blank_ratio), "absent from blank",
+                              as.character(round(blank_ratio, 1))),
+      tier
+    ) |>
+    kable()
+}
+```
+
+## Suggestive tier
+
+Enough reads to be worth inspecting, but failing breadth or spread. These are
+not detections. A coverage profile distinguishes the two explanations: reads
+concentrated on a few separated regions is what transcription of a large DNA
+virus looks like, while a single narrow spike is what cross-mapping looks like.
+
+```{r tier2_table}
+tier2 <- calls |> filter(tier == "suggestive, needs coverage check")
+
+if (nrow(tier2) == 0) {
+  cat("Nothing in the suggestive tier.\n")
+} else {
+  tier2 |>
+    arrange(desc(reads)) |>
+    transmute(
+      sample = sample_id,
+      taxon = virus_name,
+      family,
+      `ref length (kb)` = round(total_ref_length / 1000, 1),
+      reads,
+      reads_hiq,
+      `breadth %` = round(100 * breadth, 2),
+      windows = str_c(windows_covered, " / ", windows_total),
+      `windows frac` = round(windows_fraction, 3),
+      rpm = round(rpm_used, 1)
+    ) |>
+    head(30) |>
+    kable()
+}
+```
+
+# Taxa flagged in the reference
+
+Sequences marked `contamination-prone` when the reference set was built,
+chiefly XMRV and murine leukemia virus. They are kept in the index so such
+reads land where they belong rather than being pushed onto other taxa. A hit
+here is never a finding without separate verification.
+
+```{r flagged}
+flagged <- calls |> filter(!is.na(flags), flags != "")
+
+if (nrow(flagged) == 0) {
+  cat("No flagged taxon was detected in any sample.\n")
+} else {
+  flagged |>
+    arrange(desc(reads)) |>
+    transmute(sample = sample_id, taxon = virus_name, flags, reads,
+              `breadth %` = round(100 * breadth, 2),
+              `windows frac` = round(windows_fraction, 3),
+              rpm = round(rpm_used, 2), tier) |>
+    kable()
+}
+```
+
+# Family-level summary
+
+Strain-level assignment is unreliable when the reference holds many
+near-identical genomes per family, so reads are aggregated. A single infection
+typically appears as reads spread across many references of one family, which
+is why the family total is firmer than any individual row above.
+
+```{r family_summary}
+calls |>
+  group_by(family) |>
+  summarise(
+    `taxa detected` = n_distinct(virus_taxid),
+    `total reads` = sum(reads),
+    `samples with any` = n_distinct(sample_id),
+    `confident calls` = sum(str_starts(tier, "confident")),
+    .groups = "drop"
+  ) |>
+  arrange(desc(`total reads`)) |>
+  kable()
+```
+
+# Sensitivity note: anelloviruses
+
+Anelloviruses are near-ubiquitous in healthy people, so their detection was
+intended as a check that this arm works. Two caveats apply before the numbers
+are read that way. They are DNA viruses, so in an RNA library they appear only
+through transcription and a non-transcribing carrier looks negative. And they
+are among the most diverse virus families known, while the reference holds one
+genome per taxon, so a divergent strain is expected to match only its most
+conserved region.
+
+```{r anellovirus}
+anello <- calls |> filter(family == "Anelloviridae")
+
+if (nrow(anello) == 0) {
+  cat("No anellovirus reads in any sample. Read as a sensitivity flag, not a finding.\n")
+} else {
+  anello |>
+    group_by(sample_id) |>
+    summarise(
+      `taxa with reads` = n(),
+      `total reads` = sum(reads),
+      `max breadth %` = round(100 * max(breadth), 2),
+      `max windows frac` = round(max(windows_fraction), 3),
+      `any confident` = any(str_starts(tier, "confident")),
+      .groups = "drop"
+    ) |>
+    kable(caption = "Anellovirus reads per sample")
+}
+```
+
+Presence of reads is not the same as a confirmed detection. If breadth stays
+low, the coverage profile is what separates a divergent real strain from
+cross-mapping, and `scripts/viral_taxon_diagnostic.sh` is the tool for that.
+
+# Outputs written
+
+```{r write_out}
+if (isTRUE(params$write_calls_tsv)) {
+  out_file <- file.path(counts_dir, "viral_calls.tsv")
+  calls |>
+    select(sample_id, any_of(c("body_site", "group")), virus_taxid, virus_name,
+           genus, family, category, flags, reads, reads_hiq, covered_bases,
+           total_ref_length, breadth, windows_covered, windows_total,
+           windows_fraction, rpm_total, rpm_nonhost, blank_rpm, blank_ratio,
+           passes_blank, tier) |>
+    write_tsv(out_file)
+  cat("Calls written to:", out_file, "\n")
+}
+```
+
+# Notes
+
+- This report labels; it never filters a pipeline output. `viral_calls.tsv`
+  carries every taxon-sample row with its tier.
+- Thresholds in force: `r tier1_min_reads` reads,
+  `r 100 * tier1_min_breadth`% breadth and
+  `r tier1_min_windows_fraction` windows fraction for the confident tier;
+  `r tier2_min_reads` reads for the suggestive tier; blank ratio
+  `r blank_ratio_min`. They were set from this pilot's distribution and should
+  be revisited when the cohort arrives.
+- Abundance here uses `r rpm_metric`. The two denominators differ by an order
+  of magnitude in these samples because the non-host fraction ranges from
+  2.5% to 97%, so the choice belongs in the methods.
+- `windows_fraction` is used rather than the raw window count because the
+  latter is not comparable across genome sizes: the same count is most of a
+  7 kb enterovirus and a few percent of a 472 kb herpesvirus.
+- Herpesviruses in an RNA library are lytic transcription, not genome load.
+  That is a different claim from presence of the virus and should be worded as
+  such.
+- GRCh38 sits in the same index as a decoy. A large share of the reads STAR
+  could not place map back to human under local alignment, and without the
+  decoy they would have been forced onto viral genomes instead.

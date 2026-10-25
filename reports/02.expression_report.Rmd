@@ -1,0 +1,283 @@
+---
+title: "VERVE module 02: size factors and composition marker scores"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    dev: svg
+params:
+  out_dir: "/Volumes/Informatics/AlisePonsero/Krishani_CompassMe/VERVE_test"
+  sample_sheet: "/Volumes/Informatics/AlisePonsero/Krishani_CompassMe/samples.tsv"
+  markers_file: "/Volumes/Informatics/AlisePonsero/Krishani_CompassMe/marker_selection/markers.tsv"
+  size_factor_scope: "site"     # "site" or "all"; see the note below
+  size_factor_type: "ratio"     # "ratio" (DESeq2 default) or "poscounts"
+  min_count: 1                  # gene kept if total count across samples is above this
+  exclude_blanks: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      dev = "svg")
+# Bioconductor packages first, tidyverse last: S4Vectors (loaded by DESeq2)
+# exports rename(), first() and others that would otherwise mask dplyr
+library(DESeq2)
+library(GSVA)
+library(tidyverse)
+library(knitr)
+```
+
+# Inputs
+
+```{r read_inputs}
+out_step <- file.path(params$out_dir, "01_host")
+out_dir_02 <- file.path(params$out_dir, "02_expression")
+if (!dir.exists(out_dir_02)) {
+  dir.create(out_dir_02, recursive = TRUE)
+}
+
+samples_meta <- read_tsv(params$sample_sheet, show_col_types = FALSE) |>
+  select(any_of(c("sample_id", "body_site", "group", "batch")))
+
+# Case and stray whitespace in body_site would split one site into several
+# groups, and a group of one sample always gets a size factor of exactly 1.
+if ("body_site" %in% names(samples_meta)) {
+  samples_meta <- samples_meta |>
+    mutate(body_site = str_to_lower(str_trim(body_site)))
+}
+
+counts_wide <- read_tsv(file.path(out_step, "counts", "gene_counts.txt"),
+                        comment = "#", show_col_types = FALSE) |>
+  select(Geneid, ends_with(".bam")) |>
+  rename_with(~ basename(.x) |> str_remove("\\.markdup\\.bam$"),
+              ends_with(".bam"))
+
+markers <- read_tsv(params$markers_file, show_col_types = FALSE)
+
+# Samples used for normalisation and scoring
+samples_used <- samples_meta
+if (isTRUE(params$exclude_blanks) && "group" %in% names(samples_meta)) {
+  samples_used <- samples_used |>
+    filter(is.na(group) | !str_starts(group, "blank"))
+}
+samples_used <- samples_used |>
+  filter(sample_id %in% names(counts_wide))
+
+count_matrix <- counts_wide |>
+  select(Geneid, all_of(samples_used$sample_id)) |>
+  column_to_rownames("Geneid") |>
+  as.matrix()
+
+count_matrix <- count_matrix[rowSums(count_matrix) > params$min_count, ]
+
+tibble(
+  item = c("Samples in sheet", "Samples used", "Genes in matrix",
+           "Genes kept", "Markers (epithelial)", "Markers (immune)"),
+  value = c(nrow(samples_meta), ncol(count_matrix), nrow(counts_wide),
+            nrow(count_matrix),
+            sum(markers$axis == "epithelial"),
+            sum(markers$axis == "immune"))
+) |>
+  kable()
+```
+
+# Size factors
+
+DESeq2 median-of-ratios size factors, computed from cellular gene counts.
+These are what module 03 uses to normalise ERV counts: ERV counts must never be
+normalised by ERV counts, because a global induction would then be divided away.
+
+**Scope.** With `size_factor_scope = "site"` the factors are estimated within
+each body site separately, which is the default here. The median-of-ratios
+estimator assumes most genes are unchanged between the samples it compares.
+Across the three sites that assumption does not hold: the sites differ in
+epithelial type, bacterial load and recoverable human transcriptome, so a
+pooled estimate would absorb site differences into the factors themselves.
+Estimating within a site keeps the assumption plausible and matches the
+per-site analysis plan. Setting the parameter to `"all"` pools every sample,
+which is only appropriate if you intend to compare across sites.
+
+**Estimator.** `"ratio"` is the DESeq2 default and uses genes with no zero
+count in any sample of the group. `"poscounts"` uses only the positive counts
+per gene, which tolerates sparse matrices but changes what the factor is
+estimated from; it is offered as a fallback for a site where the zero-free gene
+set is too small, and any use of it should be reported.
+
+```{r size_factors}
+estimate_factors <- function(matrix_subset) {
+  dds <- DESeqDataSetFromMatrix(
+    countData = matrix_subset,
+    colData   = data.frame(sample_id = colnames(matrix_subset)),
+    design    = ~ 1
+  )
+  dds <- estimateSizeFactors(dds, type = params$size_factor_type)
+  tibble(sample_id = colnames(matrix_subset),
+         size_factor = sizeFactors(dds),
+         n_genes_used = nrow(matrix_subset))
+}
+
+if (params$size_factor_scope == "site" && "body_site" %in% names(samples_used)) {
+  size_factors <- samples_used |>
+    group_split(body_site) |>
+    map_dfr(function(site_samples) {
+      site_matrix <- count_matrix[, site_samples$sample_id, drop = FALSE]
+      site_matrix <- site_matrix[rowSums(site_matrix) > 0, , drop = FALSE]
+      estimate_factors(site_matrix) |>
+        mutate(scope = unique(site_samples$body_site))
+    })
+} else {
+  size_factors <- estimate_factors(count_matrix) |>
+    mutate(scope = "all")
+}
+
+size_factors <- size_factors |>
+  left_join(samples_meta, by = "sample_id") |>
+  mutate(library_size = colSums(count_matrix)[sample_id],
+         method = str_c(params$size_factor_type, ", scope: ",
+                        params$size_factor_scope))
+
+small_groups <- size_factors |>
+  count(scope) |>
+  filter(n < 2)
+
+if (nrow(small_groups) > 0) {
+  cat("WARNING: these groups hold fewer than two samples, so their size factor",
+      "is 1 by construction and carries no information:",
+      str_c(small_groups$scope, collapse = ", "), "\n")
+}
+
+size_factors |>
+  select(sample_id, any_of(c("body_site", "group")), scope,
+         size_factor, library_size, n_genes_used) |>
+  mutate(size_factor = round(size_factor, 3)) |>
+  kable()
+```
+
+A size factor should track library size. Strong departures from the diagonal
+mean the factor is being driven by composition rather than depth, which is
+worth knowing before it is applied to ERV counts.
+
+```{r size_factor_plot, fig.width = 6, fig.height = 4.5}
+ggplot(size_factors,
+       aes(x = library_size / 1e6, y = size_factor,
+           colour = if ("body_site" %in% names(size_factors)) body_site else NULL)) +
+  geom_point(size = 2.5) +
+  geom_text(aes(label = sample_id), hjust = -0.15, size = 3, show.legend = FALSE) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "Assigned fragments (millions)", y = "Size factor", colour = "Site") +
+  theme_minimal()
+```
+
+# Composition marker scores
+
+ssGSEA on the two marker sets, one score per sample per axis, as raw
+enrichment scores (`normalize = FALSE`). ssGSEA ranks genes within a sample, so
+the scores are invariant to the size factors above; the normalisation of the
+counts only makes the input comparable in scale.
+
+**These are relative scores, not cell type proportions.** They can be compared
+between cases and controls within a site, never across sites. If an ERV signal
+tracks these scores, that flags composition as a confounder; it does not
+quantify it.
+
+```{r scores}
+normalised <- count_matrix %*% diag(1 / size_factors$size_factor[
+  match(colnames(count_matrix), size_factors$sample_id)])
+colnames(normalised) <- colnames(count_matrix)
+log_expression <- log2(normalised + 1)
+
+marker_sets <- markers |>
+  filter(ensembl_gene_id %in% rownames(log_expression)) |>
+  split(~ axis) |>
+  map(~ pull(.x, ensembl_gene_id))
+
+present <- markers |>
+  group_by(axis) |>
+  summarise(
+    in_panel  = n(),
+    in_matrix = sum(ensembl_gene_id %in% rownames(log_expression)),
+    .groups   = "drop"
+  )
+kable(present, caption = "Marker genes present in the count matrix")
+
+# normalize = FALSE: raw enrichment scores. With the default (TRUE), every
+# score is rescaled by the range of scores across all samples in the matrix,
+# so a sample's value depends on which other samples were run with it, and
+# adding cohort samples later would shift the pilot values. Raw scores are
+# stable across runs, which matters for a score read only within a site.
+# GSVA changed to a parameter-object interface in version 1.50.
+if (packageVersion("GSVA") >= "1.50.0") {
+  ssgsea_result <- gsva(ssgseaParam(log_expression, marker_sets,
+                                    normalize = FALSE))
+} else {
+  ssgsea_result <- gsva(log_expression, marker_sets, method = "ssgsea",
+                        ssgsea.norm = FALSE)
+}
+
+# Built directly from the ssGSEA matrix (gene sets in rows, samples in columns)
+scores <- tibble(
+  sample_id        = colnames(ssgsea_result),
+  epithelial_score = ssgsea_result["epithelial", ],
+  immune_score     = ssgsea_result["immune", ]
+) |>
+  left_join(samples_meta, by = "sample_id")
+
+scores |>
+  select(sample_id, any_of(c("body_site", "group")),
+         epithelial_score, immune_score) |>
+  mutate(across(ends_with("_score"), ~ round(.x, 3))) |>
+  kable()
+```
+
+```{r score_plot, fig.width = 6, fig.height = 4.5}
+ggplot(scores,
+       aes(x = epithelial_score, y = immune_score,
+           colour = if ("body_site" %in% names(scores)) body_site else NULL)) +
+  geom_point(size = 2.5) +
+  geom_text(aes(label = sample_id), hjust = -0.15, size = 3, show.legend = FALSE) +
+  scale_x_continuous(expand = expansion(mult = c(0.08, 0.25))) +
+  labs(x = "Epithelial score", y = "Immune score", colour = "Site") +
+  theme_minimal()
+```
+
+# Outputs written
+
+```{r write_outputs}
+size_factor_file <- file.path(out_dir_02, "size_factors.tsv")
+scores_file      <- file.path(out_dir_02, "marker_scores.tsv")
+panel_file       <- file.path(out_dir_02, "markers_used.tsv")
+
+write_tsv(size_factors, size_factor_file)
+write_tsv(scores, scores_file)
+write_tsv(
+  markers |>
+    mutate(in_matrix = ensembl_gene_id %in% rownames(log_expression)),
+  panel_file
+)
+
+tibble(file = c(size_factor_file, scores_file, panel_file)) |>
+  kable()
+```
+
+# Notes for the report
+
+- Size factors come from cellular genes, never from ERV counts. Module 03
+  consumes `size_factors.tsv` as it stands here.
+- Size factors were estimated with scope `r params$size_factor_scope` and
+  estimator `r params$size_factor_type`. A change to either is a statistical
+  choice and belongs in the methods.
+- Blank controls are excluded from normalisation and scoring by default: their
+  gene counts are too sparse to contribute a meaningful factor, and including
+  them would distort the median-of-ratios estimate for their site.
+- ssGSEA was run with `normalize = FALSE`, so scores are raw enrichment
+  scores and do not depend on which other samples were in the run. They are
+  therefore comparable between this pilot and later cohort runs, which the
+  default range-scaled scores would not be.
+- The marker scores are relative, within-site only, and derived from
+  CellMarker 2.0 (doi:10.1093/nar/gkac947). The exact panel used, including
+  which genes were found in the count matrix, is written to
+  `markers_used.tsv`.
+- The epithelial axis of the current panel is weighted toward cilia and
+  squamous programmes rather than generic epithelial identity, so part of what
+  it measures is which epithelium is present rather than how much. This
+  strengthens the case for reading the score only within a site.

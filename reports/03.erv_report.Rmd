@@ -1,0 +1,598 @@
+---
+title: "VERVE module 03: ERV quantification"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    dev: svg
+params:
+  out_dir: "/qib/scratch/users/zar24gir/Krishani_CompassMe/VERVE_test"
+  sample_sheet: "/qib/scratch/users/zar24gir/Krishani_CompassMe/samples.tsv"
+  exclude_blanks_from_plots: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      dev = "svg")
+library(tidyverse)
+library(knitr)
+```
+
+# Settings
+
+Edit this chunk to change what counts as detected and what the feasibility
+flags warn about. Nothing is excluded anywhere in this report.
+
+```{r settings}
+# A locus or family counts as detected at or above this many fragments
+detect_min <- 5
+
+# Feasibility flags for locus-level analysis. Warn only.
+flag_min_erv_fragments <- 1e5    # total fragments assigned to the annotation
+flag_min_loci_detected <- 1000   # loci at or above detect_min
+
+# How a family name is split into the two element classes. The retro.hg38.v1
+# annotation combines HERV_rmsk (endogenous retroviruses) with L1Base
+# (LINE-1), and the two are reported separately throughout: L1 biology and its
+# false-positive modes differ enough that a combined total would be hard to
+# interpret.
+l1_pattern <- "^L1"
+
+# Number of families to show in the plots
+n_top_families <- 15
+```
+
+```{r read}
+out_step <- file.path(params$out_dir, "03_erv")
+counts_dir <- file.path(out_step, "counts")
+
+samples_meta <- read_tsv(params$sample_sheet, show_col_types = FALSE) |>
+  select(any_of(c("sample_id", "body_site", "group", "batch")))
+
+if ("body_site" %in% names(samples_meta)) {
+  samples_meta <- samples_meta |>
+    mutate(body_site = str_to_lower(str_trim(body_site)))
+}
+
+locus_counts <- read_tsv(file.path(counts_dir, "erv_counts_locus.tsv"),
+                         show_col_types = FALSE)
+family_counts <- read_tsv(file.path(counts_dir, "erv_counts_family.tsv"),
+                          show_col_types = FALSE)
+erv_stats <- read_tsv(file.path(counts_dir, "erv_counts_stats.tsv"),
+                      show_col_types = FALSE)
+
+sample_cols <- setdiff(names(locus_counts), "locus")
+
+# Size factors from module 02, estimated on cellular genes. ERV counts are
+# never normalised by ERV counts: a global ERV induction would otherwise be
+# divided away by its own normalisation.
+size_factor_file <- file.path(params$out_dir, "02_expression", "size_factors.tsv")
+have_size_factors <- file.exists(size_factor_file)
+
+if (have_size_factors) {
+  size_factors <- read_tsv(size_factor_file, show_col_types = FALSE) |>
+    select(sample_id, size_factor)
+} else {
+  size_factors <- tibble(sample_id = sample_cols, size_factor = NA_real_)
+}
+
+is_blank <- function(x) !is.na(x) & str_starts(x, "blank")
+```
+
+# Run summary
+
+```{r run_summary}
+long_counts <- locus_counts |>
+  pivot_longer(-locus, names_to = "sample_id", values_to = "count")
+
+per_sample <- long_counts |>
+  group_by(sample_id) |>
+  summarise(
+    assigned_fragments = sum(count),
+    loci_detected      = sum(count >= detect_min),
+    loci_nonzero       = sum(count > 0),
+    top_locus_share    = if (sum(count) > 0) max(count) / sum(count) else NA_real_,
+    .groups = "drop"
+  ) |>
+  left_join(samples_meta, by = "sample_id") |>
+  left_join(select(erv_stats, sample_id, any_of("no_feature")), by = "sample_id") |>
+  left_join(size_factors, by = "sample_id")
+
+per_sample |>
+  transmute(
+    sample = sample_id,
+    site   = if ("body_site" %in% names(per_sample)) body_site else NA,
+    group  = if ("group" %in% names(per_sample)) group else NA,
+    `ERV fragments`  = round(assigned_fragments),
+    `loci detected`  = loci_detected,
+    `loci non-zero`  = loci_nonzero,
+    `top locus %`    = round(100 * top_locus_share, 1),
+    `size factor`    = round(size_factor, 3)
+  ) |>
+  kable(caption = paste0("Detected means at or above ", detect_min,
+                         " fragments. Size factors come from module 02."))
+```
+
+`r if (!have_size_factors) "**Size factors not found.** Normalised values below are omitted; run the module 02 report first."`
+
+The statistics table from Telescope, as written by the pipeline:
+
+```{r telescope_stats}
+kable(erv_stats)
+```
+
+# HERV and LINE-1
+
+The annotation combines HERV_rmsk.hg38.v2 with L1Base.hg38.v1, so roughly half
+its loci are LINE-1 rather than endogenous retroviruses. Both are quantified
+together, deliberately: LINE-1 elements are numerous and highly similar to each
+other, so removing them from the annotation would push their reads onto HERV
+loci during the EM step. They are reported separately from here on.
+
+```{r class_split}
+family_long <- family_counts |>
+  pivot_longer(-family, names_to = "sample_id", values_to = "count") |>
+  mutate(element_class = if_else(str_detect(family, l1_pattern), "LINE-1", "HERV"))
+
+class_summary <- family_long |>
+  group_by(sample_id, element_class) |>
+  summarise(fragments = sum(count),
+            families_detected = sum(count >= detect_min),
+            .groups = "drop") |>
+  left_join(samples_meta, by = "sample_id")
+
+class_summary |>
+  select(sample_id, any_of(c("body_site", "group")), element_class,
+         fragments, families_detected) |>
+  mutate(fragments = round(fragments)) |>
+  pivot_wider(names_from = element_class,
+              values_from = c(fragments, families_detected)) |>
+  kable(caption = "Fragments and families detected, split by element class")
+```
+
+```{r class_plot, fig.width = 7, fig.height = 4.5}
+class_plot_data <- class_summary
+if (isTRUE(params$exclude_blanks_from_plots) && "group" %in% names(class_summary)) {
+  class_plot_data <- filter(class_summary, !is_blank(group))
+}
+
+ggplot(class_plot_data,
+       aes(x = sample_id, y = fragments, fill = element_class)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Fragments assigned", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Detection depth
+
+How many loci carry a usable number of fragments decides whether locus-level
+analysis is possible at all. Family-level aggregation is the fallback: fewer
+features, more fragments each.
+
+```{r detection_curve, fig.width = 7, fig.height = 4.5}
+thresholds <- c(1, 2, 5, 10, 20, 50, 100)
+
+curve_data <- map_dfr(thresholds, function(threshold) {
+  long_counts |>
+    group_by(sample_id) |>
+    summarise(n_loci = sum(count >= threshold), .groups = "drop") |>
+    mutate(threshold = threshold)
+}) |>
+  left_join(samples_meta, by = "sample_id")
+
+if (isTRUE(params$exclude_blanks_from_plots) && "group" %in% names(curve_data)) {
+  curve_data <- filter(curve_data, !is_blank(group))
+}
+
+ggplot(curve_data,
+       aes(x = threshold, y = n_loci, group = sample_id,
+           colour = if ("body_site" %in% names(curve_data)) body_site else NULL)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  scale_x_log10(breaks = thresholds) +
+  scale_y_log10(labels = scales::comma) +
+  labs(x = "Minimum fragments per locus", y = "Loci detected", colour = "Site") +
+  theme_minimal()
+```
+
+```{r detection_table}
+curve_data |>
+  select(sample_id, threshold, n_loci) |>
+  pivot_wider(names_from = threshold, values_from = n_loci,
+              names_prefix = "at ") |>
+  kable(caption = "Loci detected at increasing fragment thresholds")
+```
+
+# Dominant loci
+
+Telescope's `final_count` is an expected value under the EM model, so a locus
+can accumulate a large count from fragments that align ambiguously to many
+places.
+
+`unique_count` is the number of fragments whose alignments all fall inside a
+single annotated locus. It is reported here next to the number of loci in that
+locus's family, because the two are tightly linked: in a family with hundreds
+or thousands of near-identical copies, a fragment from a genuinely transcribed
+copy will almost always also align to its siblings and so be classed as
+ambiguous. A low unique fraction in a large family is therefore the expected
+state and says nothing about data quality; a low unique fraction in a small
+family is worth a closer look.
+
+What a high-count, low-unique locus means is that the family is expressed and
+the model has had to choose which copy to credit. The family total is on firm
+ground; the choice of copy within it is not.
+
+```{r read_full_reports}
+telescope_dir <- file.path(out_step, "telescope")
+
+find_report <- function(sample_id) {
+  candidates <- c(
+    file.path(telescope_dir, sample_id, paste0(sample_id, "-TE_counts.tsv")),
+    file.path(telescope_dir, sample_id, paste0(sample_id, "-telescope_report.tsv"))
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) > 0) {
+    return(existing[1])
+  }
+  globbed <- Sys.glob(file.path(telescope_dir, sample_id, paste0(sample_id, "-*.tsv")))
+  if (length(globbed) > 0) {
+    return(globbed[1])
+  }
+  NA_character_
+}
+
+read_report <- function(sample_id) {
+  path <- find_report(sample_id)
+  if (is.na(path)) {
+    return(NULL)
+  }
+  read_tsv(path, comment = "#", show_col_types = FALSE) |>
+    mutate(sample_id = sample_id)
+}
+
+full_reports <- map_dfr(sample_cols, read_report)
+
+have_full_reports <- nrow(full_reports) > 0 &&
+  all(c("transcript", "final_count", "unique_count") %in% names(full_reports))
+```
+
+`r if (!have_full_reports) "**Per-sample Telescope reports not found or missing the expected columns.** This section is skipped."`
+
+```{r family_sizes}
+# Number of loci per family, taken from the count matrix (Telescope reports
+# every annotated locus, so this is the annotation's own copy number)
+family_size <- locus_counts |>
+  mutate(family = if_else(str_detect(locus, "_"),
+                          str_remove(locus, "_[^_]*$"),
+                          locus)) |>
+  count(family, name = "loci_in_family")
+```
+
+```{r dominant_loci, eval = have_full_reports}
+locus_detail <- full_reports |>
+  filter(transcript != "__no_feature") |>
+  group_by(sample_id) |>
+  mutate(share = final_count / sum(final_count)) |>
+  ungroup() |>
+  mutate(
+    unique_fraction = if_else(final_count > 0, unique_count / final_count, NA_real_),
+    element_class = if_else(str_detect(transcript, l1_pattern), "LINE-1", "HERV"),
+    family = if_else(str_detect(transcript, "_"),
+                     str_remove(transcript, "_[^_]*$"),
+                     transcript)
+  ) |>
+  left_join(family_size, by = "family") |>
+  left_join(samples_meta, by = "sample_id")
+
+locus_detail |>
+  group_by(sample_id) |>
+  slice_max(final_count, n = 3, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(desc(share)) |>
+  transmute(
+    sample = sample_id,
+    site = if ("body_site" %in% names(locus_detail)) body_site else NA,
+    locus = transcript,
+    class = element_class,
+    final_count = round(final_count),
+    `share of sample %` = round(100 * share, 1),
+    unique_count = round(unique_count),
+    `unique %` = round(100 * unique_fraction, 1),
+    `loci in family` = loci_in_family
+  ) |>
+  kable(caption = paste("Three highest-count loci per sample.",
+                        "A low unique % alongside a large family is expected,",
+                        "not a warning."))
+```
+
+```{r unique_support_plot, fig.width = 7, fig.height = 4.5, eval = have_full_reports}
+plot_detail <- locus_detail |>
+  filter(final_count >= detect_min)
+
+if (isTRUE(params$exclude_blanks_from_plots) && "group" %in% names(plot_detail)) {
+  plot_detail <- filter(plot_detail, !is_blank(group))
+}
+
+ggplot(plot_detail,
+       aes(x = final_count, y = unique_fraction,
+           colour = if ("body_site" %in% names(plot_detail)) body_site else NULL)) +
+  geom_point(alpha = 0.3, size = 1) +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "final_count (log scale)",
+       y = "Fragments aligning uniquely to this locus",
+       colour = "Site") +
+  theme_minimal()
+```
+
+Loci low on the vertical axis are ones the model had to place among several
+candidate copies. Read them together with family size: most will belong to
+large families, where that is unavoidable.
+
+```{r unique_support_summary, eval = have_full_reports}
+locus_detail |>
+  filter(final_count >= detect_min) |>
+  group_by(sample_id) |>
+  summarise(
+    `loci at or above detect_min` = n(),
+    `median unique %` = round(100 * median(unique_fraction, na.rm = TRUE), 1),
+    `low unique, large family` = sum(unique_fraction < 0.10 & loci_in_family >= 100,
+                                     na.rm = TRUE),
+    `low unique, small family` = sum(unique_fraction < 0.10 & loci_in_family < 100,
+                                     na.rm = TRUE),
+    `share of signal, low unique %` = round(
+      100 * sum(share[unique_fraction < 0.10], na.rm = TRUE), 1),
+    .groups = "drop"
+  ) |>
+  kable(caption = paste("Loci the model had to place. The split by family size",
+                        "separates the expected cases (large families) from the",
+                        "ones worth checking (small families)."))
+```
+
+## Concentration within a family
+
+When a family's signal sits almost entirely on one of its copies, that can be
+genuine (copies do differ in expression) or it can be the model settling on one
+candidate. Comparing across individuals separates the two: a copy that takes
+the same large share in every person is more likely to be really expressed,
+while a share that jumps between people points at the model choosing.
+
+```{r family_concentration, eval = have_full_reports}
+concentration <- locus_detail |>
+  filter(loci_in_family >= 10) |>
+  group_by(sample_id, family) |>
+  summarise(
+    family_total = sum(final_count),
+    top_locus = transcript[which.max(final_count)],
+    top_share = max(final_count) / sum(final_count),
+    loci_in_family = first(loci_in_family),
+    .groups = "drop"
+  ) |>
+  left_join(samples_meta, by = "sample_id")
+
+if ("group" %in% names(concentration)) {
+  concentration <- filter(concentration, !is_blank(group))
+}
+
+concentration |>
+  group_by(family) |>
+  filter(sum(family_total) > 0) |>
+  summarise(
+    loci_in_family = first(loci_in_family),
+    `total fragments` = round(sum(family_total)),
+    `median top-copy share %` = round(100 * median(top_share), 1),
+    `same top copy in n samples` = max(table(top_locus)),
+    `n samples` = n(),
+    .groups = "drop"
+  ) |>
+  slice_max(`total fragments`, n = 15) |>
+  kable(caption = paste("Families with 10 or more copies, by total fragments.",
+                        "A high top-copy share that falls on the same copy in",
+                        "every sample is the more credible pattern."))
+```
+
+# Loci analysable within a site
+
+A locus can only enter a locus-level model if it is detected across the
+samples being compared. This is the figure the feasibility thresholds should
+be set from, rather than per-sample depth: a sample with many detected loci
+contributes nothing if they are different loci each time.
+
+With a pilot of one sample per site per individual these numbers are
+necessarily small, and they will grow with the cohort. They are reported here
+as a lower bound on what locus-level analysis would have to work with.
+
+```{r analysable_set}
+site_counts <- long_counts |>
+  left_join(samples_meta, by = "sample_id")
+
+if ("group" %in% names(site_counts)) {
+  site_counts <- filter(site_counts, !is_blank(group))
+}
+
+if ("body_site" %in% names(site_counts)) {
+  analysable <- map_dfr(thresholds, function(threshold) {
+    site_counts |>
+      group_by(body_site, locus) |>
+      summarise(
+        n_samples = n(),
+        n_detected = sum(count >= threshold),
+        .groups = "drop_last"
+      ) |>
+      summarise(
+        `in all samples` = sum(n_detected == n_samples),
+        `in at least one` = sum(n_detected >= 1),
+        .groups = "drop"
+      ) |>
+      mutate(threshold = threshold)
+  })
+
+  analysable |>
+    select(body_site, threshold, `in all samples`, `in at least one`) |>
+    arrange(body_site, threshold) |>
+    kable(caption = "Loci detected in every sample of a site, and in at least one")
+} else {
+  cat("No body_site column in the sample sheet; cannot compute per-site sets.\n")
+}
+```
+
+```{r analysable_class}
+if ("body_site" %in% names(site_counts)) {
+  site_counts |>
+    mutate(element_class = if_else(str_detect(locus, l1_pattern), "LINE-1", "HERV")) |>
+    group_by(body_site, element_class, locus) |>
+    summarise(n_samples = n(), n_detected = sum(count >= detect_min),
+              .groups = "drop_last") |>
+    summarise(`loci in all samples` = sum(n_detected == n_samples), .groups = "drop") |>
+    pivot_wider(names_from = element_class, values_from = `loci in all samples`) |>
+    kable(caption = paste0("Consistently detected loci (at or above ", detect_min,
+                           " fragments in every sample of the site), by class"))
+}
+```
+
+# Families
+
+Counts are divided by the module 02 size factors before comparison, so library
+depth does not drive the ranking. Within a site only: the sites differ too much
+in recoverable transcriptome for a cross-site comparison of these values to
+mean anything.
+
+```{r family_normalised}
+family_normalised <- family_long |>
+  left_join(size_factors, by = "sample_id") |>
+  mutate(normalised = if_else(is.na(size_factor), NA_real_, count / size_factor)) |>
+  left_join(samples_meta, by = "sample_id")
+
+if (isTRUE(params$exclude_blanks_from_plots) && "group" %in% names(family_normalised)) {
+  family_plot_data <- filter(family_normalised, !is_blank(group))
+} else {
+  family_plot_data <- family_normalised
+}
+
+top_families <- family_plot_data |>
+  group_by(family) |>
+  summarise(total = sum(count), .groups = "drop") |>
+  slice_max(total, n = n_top_families) |>
+  pull(family)
+```
+
+```{r family_heatmap, fig.width = 8, fig.height = 5.5, eval = have_size_factors}
+family_plot_data |>
+  filter(family %in% top_families) |>
+  mutate(family = factor(family, levels = rev(top_families))) |>
+  ggplot(aes(x = sample_id, y = family, fill = log10(normalised + 1))) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "mako", direction = -1) +
+  labs(x = NULL, y = NULL, fill = "log10\n(normalised + 1)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+
+```{r family_table}
+family_plot_data |>
+  filter(family %in% top_families) |>
+  mutate(element_class = if_else(str_detect(family, l1_pattern), "LINE-1", "HERV")) |>
+  group_by(family, element_class) |>
+  summarise(
+    total_fragments = round(sum(count)),
+    median_per_sample = round(median(count)),
+    samples_detected = sum(count >= detect_min),
+    .groups = "drop"
+  ) |>
+  arrange(desc(total_fragments)) |>
+  kable(caption = paste0("Top ", n_top_families, " families by total fragments"))
+```
+
+# Blank controls
+
+A negative control should carry few ERV fragments. Anything substantial here
+points to contamination or index misassignment rather than biology, and belongs
+in the module 05 discussion.
+
+```{r blanks}
+if ("group" %in% names(per_sample) && any(is_blank(per_sample$group))) {
+  per_sample |>
+    filter(is_blank(group)) |>
+    transmute(sample = sample_id,
+              `ERV fragments` = round(assigned_fragments),
+              `loci detected` = loci_detected,
+              `share of median real sample` = round(
+                100 * assigned_fragments /
+                  median(per_sample$assigned_fragments[!is_blank(per_sample$group)]), 2)) |>
+    kable()
+} else {
+  cat("No blank controls in the sample sheet.\n")
+}
+```
+
+# Feasibility flags
+
+Warnings only. No sample is excluded here or anywhere else in the pipeline.
+
+```{r flags}
+flags <- per_sample |>
+  mutate(
+    flag_fragments = if_else(assigned_fragments < flag_min_erv_fragments,
+                             "WARN", "PASS"),
+    flag_loci = if_else(loci_detected < flag_min_loci_detected, "WARN", "PASS"),
+    locus_level = if_else(flag_fragments == "PASS" & flag_loci == "PASS",
+                          "locus level feasible",
+                          "family level recommended")
+  )
+
+if ("group" %in% names(flags)) {
+  flags <- flags |>
+    mutate(locus_level = if_else(is_blank(group),
+                                 "blank control, not assessed", locus_level))
+}
+
+flags |>
+  transmute(
+    sample = sample_id,
+    site = if ("body_site" %in% names(flags)) body_site else NA,
+    `ERV fragments` = flag_fragments,
+    `loci detected` = flag_loci,
+    verdict = locus_level
+  ) |>
+  kable()
+
+tibble(
+  Flag = c("ERV fragments", "Loci detected"),
+  Threshold = c(paste("below", format(flag_min_erv_fragments, scientific = FALSE)),
+                paste("below", flag_min_loci_detected,
+                      "loci at", detect_min, "or more fragments"))
+) |>
+  kable(caption = "Thresholds in force for this report")
+```
+
+# Notes
+
+- Counts are Telescope `final_count`, the column intended for negative-binomial
+  models such as DESeq2.
+- Normalisation uses module 02 size factors, estimated on cellular genes within
+  each body site. ERV counts are never used to normalise themselves.
+- Telescope reassigns ambiguously mapped fragments probabilistically rather
+  than discarding them, so a locus-level count is an expected value under the
+  model, not a count of unambiguous reads. The `unique_count` column of each
+  per-sample report gives the unambiguous subset if a locus needs checking.
+- The alignment feeding this module is deliberately permissive (bowtie2
+  `-k 100`, approximately 95% identity), which is what gives the EM model
+  something to work with. It is not comparable to the module 01 STAR alignment.
+- LINE-1 and HERV are kept apart throughout. The LINE-1 component is present so
+  that its reads are not forced onto HERV loci, not because it is part of the
+  study question. Note that LINE-1 resolves to very few families, so
+  family-level aggregation is not meaningful on that side; LINE-1 is
+  interpretable only at locus level, which is also the least robust level.
+- `unique_count` counts fragments whose alignments all fall inside one
+  annotated locus. It is confounded with family copy number: in a family of
+  hundreds of near-identical copies, almost no fragment can qualify, however
+  real the expression. It is reported next to family size for that reason, and
+  should not be used as a quality filter on its own, since doing so would
+  discard the high-copy families the study is about.
+- Family totals are better supported than any individual copy within a family.
+  Where a family is large and ambiguity is high, the family-level matrix is the
+  defensible unit of analysis and locus-level results are exploratory.

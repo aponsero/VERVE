@@ -1,0 +1,338 @@
+---
+title: "VERVE module 01: host alignment and feasibility QC"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+params:
+  write_flags_tsv: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(knitr)
+
+out_dir="/Volumes/Informatics/AlisePonsero/Krishani_CompassMe/VERVE_test"
+sample_sheet="/Volumes/Informatics/AlisePonsero/Krishani_CompassMe/samples.tsv"
+```
+
+# Thresholds
+
+Edit this chunk to change the flags. Nothing is ever excluded: these produce
+warnings only, and every sample stays in the outputs regardless of its flags.
+
+`direction` says which side is bad: `low` means small values are a problem
+(depth, genes detected), `high` means large values are (rRNA, duplication).
+Set a threshold to `NA` to switch that level off.
+
+```{r thresholds}
+thresholds <- tribble(
+  ~metric,              ~label,                    ~direction, ~warn,  ~fail,
+  "assigned_fragments", "Assigned fragments",      "low",      5e6,    1e6,
+  "genes_detected_10",  "Genes detected (10+)",    "low",      10000,  5000,
+  "median_cv_coverage", "Median CV coverage",      "high",     0.8,    1.0,
+  "rrna_pct",           "rRNA (SortMeRNA)",        "high",     50,     75,
+  "duplication_pct",    "Duplication",             "high",     80,     NA,
+  "intergenic_pct",     "Intergenic bases",        "high",     50,     70,
+  "correct_strand_pct", "Correct strand",          "low",      95,     90,
+  "unique_map_pct",     "Uniquely mapped",         "low",      30,     15
+)
+
+# Requirements for locus-level ERV quantification. If any is not met, the
+# sample is reported as suitable for family-level aggregation only.
+locus_level_rules <- list(
+  assigned_fragments = 5e6,
+  genes_detected_10  = 10000,
+  median_cv_coverage = 0.8   # upper limit
+)
+
+# Minimum count for a gene to be called detected
+gene_detect_min <- 10
+```
+
+```{r paths}
+out_step   <- file.path(out_dir, "01_host")
+dir_align  <- file.path(out_step, "align")
+dir_bamqc  <- file.path(out_step, "bamqc")
+dir_rrna   <- file.path(out_step, "rrna")
+dir_counts <- file.path(out_step, "counts")
+
+samples_meta <- read_tsv(sample_sheet, show_col_types = FALSE) |>
+  select(any_of(c("sample_id", "body_site", "group", "batch")))
+
+sample_ids <- samples_meta$sample_id
+```
+
+```{r parsers}
+# STAR Log.final.out -----------------------------------------------------------
+parse_star <- function(sample_id) {
+  f <- file.path(dir_align, paste0(sample_id, ".Log.final.out"))
+  if (!file.exists(f)) return(tibble(sample_id = sample_id))
+  lines <- read_lines(f)
+  grab <- function(pattern) {
+    hit <- str_subset(lines, fixed(pattern))
+    if (length(hit) == 0) return(NA_real_)
+    hit[1] |> str_split("\\|") |> pluck(1, 2) |> str_remove("%") |>
+      str_trim() |> as.numeric()
+  }
+  tibble(
+    sample_id       = sample_id,
+    input_reads     = grab("Number of input reads"),
+    unique_map_pct  = grab("Uniquely mapped reads %"),
+    multi_map_pct   = grab("% of reads mapped to multiple loci"),
+    too_many_pct    = grab("% of reads mapped to too many loci"),
+    unmapped_short_pct = grab("% of reads unmapped: too short")
+  )
+}
+
+# Picard metrics files ---------------------------------------------------------
+# One "## METRICS CLASS" block: header line, then one data row per read group
+# or library (the first row is used).
+parse_picard <- function(path) {
+  if (!file.exists(path)) return(tibble())
+  lines <- read_lines(path)
+  start <- str_which(lines, "^## METRICS CLASS")
+  if (length(start) == 0) return(tibble())
+  header <- str_split(lines[start + 1], "\t")[[1]]
+  values <- str_split(lines[start + 2], "\t")[[1]]
+  length(values) <- length(header)
+  set_names(as.list(values), header) |> as_tibble()
+}
+
+# Fetch the first field present among the names given, as a single number.
+# Returns NA if the file does not carry any of them, so a Picard version that
+# renames a field degrades to a missing value rather than an error.
+pick_num <- function(m, ...) {
+  nm <- intersect(c(...), names(m))
+  if (length(nm) == 0 || nrow(m) == 0) return(NA_real_)
+  suppressWarnings(as.numeric(m[[nm[1]]][1]))
+}
+
+parse_rnaseq_metrics <- function(sample_id) {
+  m <- parse_picard(file.path(dir_bamqc, paste0(sample_id, ".rnaseq_metrics.txt")))
+  tibble(
+    sample_id          = sample_id,
+    coding_pct         = 100 * pick_num(m, "PCT_CODING_BASES", "PCT_CODING"),
+    utr_pct            = 100 * pick_num(m, "PCT_UTR_BASES", "PCT_UTR"),
+    intronic_pct       = 100 * pick_num(m, "PCT_INTRONIC_BASES", "PCT_INTRONIC"),
+    intergenic_pct     = 100 * pick_num(m, "PCT_INTERGENIC_BASES", "PCT_INTERGENIC"),
+    mrna_pct           = 100 * pick_num(m, "PCT_MRNA_BASES"),
+    correct_strand_pct = 100 * pick_num(m, "PCT_CORRECT_STRAND_READS"),
+    median_cv_coverage = pick_num(m, "MEDIAN_CV_COVERAGE"),
+    bias_5p_to_3p      = pick_num(m, "MEDIAN_5PRIME_TO_3PRIME_BIAS")
+  )
+}
+
+parse_markdup <- function(sample_id) {
+  m <- parse_picard(file.path(dir_bamqc, paste0(sample_id, ".markdup_metrics.txt")))
+  tibble(
+    sample_id       = sample_id,
+    duplication_pct = 100 * pick_num(m, "PERCENT_DUPLICATION")
+  )
+}
+
+# SortMeRNA log ----------------------------------------------------------------
+# Tolerant parsing: the total and the aligned count are read by pattern, and
+# NA is returned if the log format does not match, rather than guessing.
+parse_sortmerna <- function(sample_id) {
+  f <- file.path(dir_rrna, paste0(sample_id, ".log"))
+  if (!file.exists(f)) return(tibble(sample_id = sample_id))
+  lines <- read_lines(f)
+  num_after <- function(pattern) {
+    hit <- str_subset(lines, regex(pattern, ignore_case = TRUE))
+    if (length(hit) == 0) return(NA_real_)
+    str_extract(hit[1], "[0-9]+(?=\\s*(\\(|$))|[0-9]+") |> as.numeric()
+  }
+  total   <- num_after("Total reads\\s*=")
+  aligned <- num_after("Total reads passing E-value threshold")
+  tibble(
+    sample_id     = sample_id,
+    rrna_reads    = aligned,
+    rrna_total    = total,
+    rrna_pct      = if (is.na(aligned) || is.na(total) || total == 0) NA_real_
+                    else 100 * aligned / total
+  )
+}
+```
+
+```{r counts}
+# featureCounts summary --------------------------------------------------------
+summary_file <- file.path(dir_counts, "gene_counts.txt.summary")
+fc_summary <- read_tsv(summary_file, show_col_types = FALSE) |>
+  rename(status = 1) |>
+  pivot_longer(-status, names_to = "bam", values_to = "n") |>
+  mutate(sample_id = basename(bam) |> str_remove("\\.markdup\\.bam$")) |>
+  group_by(sample_id) |>
+  summarise(
+    assigned_fragments = n[status == "Assigned"],
+    assigned_pct       = 100 * n[status == "Assigned"] / sum(n),
+    multimapping_pct   = 100 * n[status == "Unassigned_MultiMapping"] / sum(n),
+    .groups = "drop"
+  )
+
+# Gene count matrix ------------------------------------------------------------
+counts_file <- file.path(dir_counts, "gene_counts.txt")
+counts <- read_tsv(counts_file, comment = "#", show_col_types = FALSE) |>
+  select(Geneid, ends_with(".bam")) |>
+  rename_with(~ basename(.x) |> str_remove("\\.markdup\\.bam$"), ends_with(".bam"))
+
+genes_detected <- counts |>
+  pivot_longer(-Geneid, names_to = "sample_id", values_to = "count") |>
+  group_by(sample_id) |>
+  summarise(genes_detected_10 = sum(count >= gene_detect_min), .groups = "drop")
+```
+
+```{r assemble}
+metrics <- samples_meta |>
+  left_join(map_dfr(sample_ids, parse_star), by = "sample_id") |>
+  left_join(map_dfr(sample_ids, parse_rnaseq_metrics), by = "sample_id") |>
+  left_join(map_dfr(sample_ids, parse_markdup), by = "sample_id") |>
+  left_join(map_dfr(sample_ids, parse_sortmerna), by = "sample_id") |>
+  left_join(fc_summary, by = "sample_id") |>
+  left_join(genes_detected, by = "sample_id")
+
+is_blank <- function(x) !is.na(x) & str_starts(x, "blank")
+```
+
+# Run summary
+
+Input reads are STAR input fragments (read pairs). Assigned fragments are
+featureCounts fragments in genes. rRNA is the SortMeRNA fraction over all
+reads, not the Picard ribosomal metric (see notes).
+
+```{r summary_table}
+metrics |>
+  transmute(
+    sample    = sample_id,
+    site      = if ("body_site" %in% names(metrics)) body_site else NA,
+    group     = if ("group" %in% names(metrics)) group else NA,
+    `input (M)`      = round(input_reads / 1e6, 1),
+    `uniq %`         = round(unique_map_pct, 1),
+    `multi %`        = round(multi_map_pct, 1),
+    `too short %`    = round(unmapped_short_pct, 1),
+    `rRNA %`         = round(rrna_pct, 1),
+    `intergenic %`   = round(intergenic_pct, 1),
+    `dup %`          = round(duplication_pct, 1),
+    `assigned (M)`   = round(assigned_fragments / 1e6, 2),
+    `genes 10+`      = genes_detected_10,
+    `CV cov`         = round(median_cv_coverage, 2),
+    `strand %`       = round(correct_strand_pct, 1)
+  ) |>
+  kable()
+```
+
+# Flags
+
+```{r flag_logic}
+flag_one <- function(value, direction, warn, fail) {
+  if (is.na(value)) return("NA")
+  if (!is.na(fail) && ((direction == "low" && value < fail) ||
+                       (direction == "high" && value > fail))) return("FAIL")
+  if (!is.na(warn) && ((direction == "low" && value < warn) ||
+                       (direction == "high" && value > warn))) return("WARN")
+  "PASS"
+}
+
+flags_long <- metrics |>
+  select(sample_id, any_of(thresholds$metric)) |>
+  pivot_longer(-sample_id, names_to = "metric", values_to = "value") |>
+  left_join(thresholds, by = "metric") |>
+  mutate(flag = pmap_chr(list(value, direction, warn, fail), flag_one))
+
+flags_wide <- flags_long |>
+  select(sample_id, label, flag) |>
+  pivot_wider(names_from = label, values_from = flag) |>
+  left_join(select(metrics, sample_id, any_of(c("body_site", "group"))),
+            by = "sample_id")
+```
+
+```{r verdicts}
+value_of <- function(df, sample, metric) df[[metric]][df$sample_id == sample]
+
+verdicts <- metrics |>
+  rowwise() |>
+  mutate(
+    n_fail = sum(flags_long$flag[flags_long$sample_id == sample_id] == "FAIL"),
+    n_warn = sum(flags_long$flag[flags_long$sample_id == sample_id] == "WARN"),
+    locus_level_ok = !is.na(assigned_fragments) &&
+      assigned_fragments >= locus_level_rules$assigned_fragments &&
+      !is.na(genes_detected_10) &&
+      genes_detected_10 >= locus_level_rules$genes_detected_10 &&
+      (is.na(median_cv_coverage) ||
+         median_cv_coverage <= locus_level_rules$median_cv_coverage),
+    verdict = case_when(
+      is_blank(if ("group" %in% names(metrics)) group else NA_character_) ~
+        "blank control, not assessed",
+      n_fail > 0 & !locus_level_ok ~ "review before use; ERV family level only",
+      n_fail > 0                   ~ "review before use",
+      !locus_level_ok              ~ "usable; ERV family level only",
+      n_warn > 0                   ~ "usable, with warnings",
+      TRUE                         ~ "usable"
+    )
+  ) |>
+  ungroup() |>
+  select(sample_id, n_warn, n_fail, verdict)
+```
+
+```{r flag_table}
+flags_wide |>
+  left_join(verdicts, by = "sample_id") |>
+  select(sample = sample_id, any_of(c("body_site", "group")),
+         everything(), -n_warn, -n_fail) |>
+  kable()
+```
+
+```{r thresholds_used}
+thresholds |>
+  transmute(Metric = label,
+            Direction = if_else(direction == "low",
+                                "low values flagged", "high values flagged"),
+            Warn = warn, Fail = fail) |>
+  kable(caption = "Thresholds in force for this report")
+```
+
+```{r write_out}
+if (isTRUE(params$write_flags_tsv)) {
+  out_file <- file.path(out_step, "qc_flags.tsv")
+  metrics |>
+    left_join(verdicts, by = "sample_id") |>
+    write_tsv(out_file)
+  cat("Flag table written to:", out_file, "\n")
+}
+```
+
+# Samples needing attention
+
+```{r attention}
+attention <- flags_long |>
+  filter(flag %in% c("WARN", "FAIL")) |>
+  left_join(select(metrics, sample_id, any_of("group")), by = "sample_id") |>
+  filter(!is_blank(if ("group" %in% names(metrics)) group else NA_character_)) |>
+  transmute(sample = sample_id, metric = label, value = round(value, 2), flag) |>
+  arrange(desc(flag), sample)
+
+if (nrow(attention) == 0) {
+  cat("No warnings raised.\n")
+} else {
+  kable(attention)
+}
+```
+
+# Notes on interpretation
+
+- Nothing here excludes a sample. Flags are warnings, and the decision to drop
+  a sample stays with the analyst.
+- The Picard ribosomal metric is not used for the rRNA flag. The 45S rDNA
+  arrays are poorly represented in GRCh38, so Picard reports values near zero
+  regardless of the true rRNA content. SortMeRNA carries this metric.
+- The SortMeRNA eukaryotic database is a proxy for human rRNA: fungal rRNA also
+  matches it, which may inflate the fraction at sites with fungal load.
+- A high intergenic fraction can indicate residual genomic DNA, but it can also
+  reflect unannotated transcription. Read it together with the correct-strand
+  percentage: genomic DNA is unstranded, so a strand percentage near 50 would
+  point to DNA carryover, while a high value argues against it.
+- Locus-level ERV suitability uses depth, gene repertoire and coverage
+  evenness. Family-level aggregation is the fallback primary readout, not a
+  lesser analysis.
